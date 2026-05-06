@@ -27,56 +27,62 @@ export const SYMBOLS: SymbolConfig[] = [
   },
 ];
 
-const BYBIT_BASE = "https://api.bybit.com";
+// Binance Futures API — works on Vercel (no geo-block)
+const BINANCE_BASE = "https://fapi.binance.com";
 
-export async function fetchBybitTicker(symbol: string): Promise<any> {
-  const url = `${BYBIT_BASE}/v5/market/tickers?category=linear&symbol=${symbol}`;
-  const res = await fetch(url, { next: { revalidate: 0 } });
-  if (!res.ok) throw new Error(`Bybit fetch failed: ${res.status}`);
-  const json = await res.json();
-  if (json.retCode !== 0) throw new Error(`Bybit error: ${json.retMsg}`);
-  return json.result.list[0];
+export async function fetchBinanceTicker(symbol: string): Promise<any> {
+  const url = `${BINANCE_BASE}/fapi/v1/ticker/24hr?symbol=${symbol}`;
+  const res = await fetch(url, {
+    headers: { "Accept": "application/json" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`Binance fetch failed: ${res.status}`);
+  return res.json();
 }
 
-export async function fetchBybitFundingRate(symbol: string): Promise<any> {
-  const url = `${BYBIT_BASE}/v5/market/funding/history?category=linear&symbol=${symbol}&limit=1`;
-  const res = await fetch(url, { next: { revalidate: 0 } });
+export async function fetchBinancePremiumIndex(symbol: string): Promise<any> {
+  const url = `${BINANCE_BASE}/fapi/v1/premiumIndex?symbol=${symbol}`;
+  const res = await fetch(url, {
+    headers: { "Accept": "application/json" },
+    cache: "no-store",
+  });
   if (!res.ok) return null;
-  const json = await res.json();
-  return json.result?.list?.[0] ?? null;
+  return res.json();
 }
 
-export function mapBybitToB2(raw: any, config: SymbolConfig): TickerData {
-  const last = parseFloat(raw.lastPrice ?? "0");
-  const open24h = parseFloat(raw.prevPrice24h ?? raw.openPrice ?? "0");
+export function mapBinanceToB2(ticker: any, premium: any, config: SymbolConfig): TickerData {
+  const last = parseFloat(ticker.lastPrice ?? "0");
+  const open24h = parseFloat(ticker.openPrice ?? "0");
   const priceChange = open24h > 0 ? ((last - open24h) / open24h) * 100 : 0;
 
-  // Perpetual swaps — no creation or expiry timestamp
-  // For futures/options, these would come from a separate instrument API
-  const creation_timestamp = undefined;
-  const expiry_timestamp = undefined;
+  // Next funding time — Binance gives it in premiumIndex
+  // Funding happens every 8 hours: 00:00, 08:00, 16:00 UTC
+  const now = Date.now();
+  const nextFunding = premium?.nextFundingTime
+    ? parseInt(premium.nextFundingTime)
+    : now + (8 * 3600 * 1000) - (now % (8 * 3600 * 1000));
 
   return {
     ticker_id: config.ticker_id,
     base_currency: config.base,
     quote_currency: config.quote,
     last_price: last,
-    base_volume: parseFloat(raw.volume24h ?? "0"),
-    USD_volume: parseFloat(raw.turnover24h ?? "0"),
-    quote_volume: parseFloat(raw.turnover24h ?? "0"),
-    bid: parseFloat(raw.bid1Price ?? "0"),
-    ask: parseFloat(raw.ask1Price ?? "0"),
-    high: parseFloat(raw.highPrice24h ?? "0"),
-    low: parseFloat(raw.lowPrice24h ?? "0"),
+    base_volume: parseFloat(ticker.volume ?? "0"),
+    USD_volume: parseFloat(ticker.quoteVolume ?? "0"),
+    quote_volume: parseFloat(ticker.quoteVolume ?? "0"),
+    bid: parseFloat(ticker.bidPrice ?? "0"),
+    ask: parseFloat(ticker.askPrice ?? "0"),
+    high: parseFloat(ticker.highPrice ?? "0"),
+    low: parseFloat(ticker.lowPrice ?? "0"),
     product_type: "Perpetual",
-    open_interest: parseFloat(raw.openInterest ?? "0"),
-    open_interest_usd: parseFloat(raw.openInterestValue ?? "0"),
-    index_price: parseFloat(raw.indexPrice ?? "0"),
-    creation_timestamp,   // undefined for perpetuals (B2 spec: not needed)
-    expiry_timestamp,     // undefined for perpetuals (B2 spec: not needed)
-    funding_rate: parseFloat(raw.fundingRate ?? "0"),
-    next_funding_rate: parseFloat(raw.fundingRate ?? "0"),
-    next_funding_rate_timestamp: parseInt(raw.nextFundingTime ?? "0"),
+    open_interest: 0, // separate call needed — /fapi/v1/openInterest
+    open_interest_usd: 0,
+    index_price: parseFloat(premium?.indexPrice ?? ticker.lastPrice ?? "0"),
+    creation_timestamp: undefined,
+    expiry_timestamp: undefined,
+    funding_rate: parseFloat(premium?.lastFundingRate ?? "0"),
+    next_funding_rate: parseFloat(premium?.lastFundingRate ?? "0"),
+    next_funding_rate_timestamp: nextFunding,
     maker_fee: -0.0001,
     taker_fee: 0.0006,
     price_change_24h: priceChange,
@@ -86,8 +92,11 @@ export function mapBybitToB2(raw: any, config: SymbolConfig): TickerData {
 export async function fetchAllTickers(): Promise<TickerData[]> {
   const results = await Promise.allSettled(
     SYMBOLS.map(async (config) => {
-      const raw = await fetchBybitTicker(config.symbol);
-      return mapBybitToB2(raw, config);
+      const [ticker, premium] = await Promise.all([
+        fetchBinanceTicker(config.symbol),
+        fetchBinancePremiumIndex(config.symbol),
+      ]);
+      return mapBinanceToB2(ticker, premium, config);
     })
   );
 
